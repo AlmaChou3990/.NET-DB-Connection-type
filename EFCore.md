@@ -261,3 +261,102 @@ public class UserStatsDto
 - **複雜查詢，但格式仍為單一資料表**：使用 **`FromSqlInterpolated`**。
 - **批次更新、呼叫預存程序**：使用 **`ExecuteSqlInterpolatedAsync`**。
 - **報表、多表 JOIN 後只取少數欄位、臨時統計結果**：使用 **Dapper** (搭配 EF Core 的 `GetDbConnection()`)。
+
+
+Viewed SystemAnalysis.txt:91-129
+
+簡單來說，**Dapper 與 ADO.NET 並不是競爭或對立的關係，而是「包裝」與「被包裝」的關係**。
+
+不論您使用的是 **EF Core** 還是 **Dapper**，它們的底層全部都是基於 **ADO.NET** 來建立資料庫連線並傳送資料。
+
+以下為您詳細解析它們的關係、連線本質以及開發上的關鍵差異：
+
+---
+
+## 1. 連線 (Connection) 的本質：兩者完全相同
+
+在「**連線資料庫**」這一點上，Dapper 與 ADO.NET **沒有任何硬體或效能上的差異**：
+- 它們在底層都使用 ADO.NET 的 `SqlConnection`（以 SQL Server 為例）。
+- 它們都依賴 .NET 的 **Connection Pooling (連線池)** 技術，重複利用已建立的實體 TCP 連線，避免頻繁中斷與重新連線的效能開銷。
+- Dapper 甚至**沒有自己專屬的 Connection 物件**，它的所有語法都是直接寫在 ADO.NET `DbConnection` 上的**擴充方法 (Extension Methods)**。
+
+---
+
+## 2. 開作開發上的巨大差異 (對比表)
+
+雖然連線本質相同，但在**撰寫程式碼**與**資料映射 (Mapping)** 上，Dapper 對 ADO.NET 進行了極大的簡化：
+
+| 比較項目 | ADO.NET (最底層原生技術) | Dapper (微型 ORM / Micro-ORM) |
+| :--- | :--- | :--- |
+| **定位** | .NET 原生最底層的資料庫存取 API。 | 基於 ADO.NET 之上的輕量級物件映射擴充包。 |
+| **程式碼長度** | 非常冗長，需撰寫大量重複的開關與讀取程式碼。 | 極度簡潔，通常只需 1 ~ 3 行即可搞定。 |
+| **物件映射 (Mapping)** | **必須手動對應**。需要用 `reader["Col"].ToString()` 一個一個將欄位塞入 C# 物件。 | **自動對應**。只要 C# 屬性名稱與資料庫欄位名稱一致，會自動完成轉換。 |
+| **防範 SQL 注入** | 需手動撰寫繁瑣的 `Parameters.AddWithValue(...)` 綁定。 | 傳入 C# 匿名物件（如 `new { id }`），Dapper 會**自動完成參數化**。 |
+| **執行效能** | **極限效能 (100%)**，因為沒有經過任何額外的包裝。 | **近乎原生效能 (99%)**，利用 IL (中間語言) 快取技術，耗損極微。 |
+
+---
+
+## 3. 程式碼對照範例：查詢單一使用者
+
+假設我們要執行一條 SQL：`SELECT * FROM tbmUSERS WHERE fsUSERNAME = @username` 並轉成 `SystemUser` 物件：
+
+### ❌ ADO.NET 傳統寫法 (繁瑣、易出錯)
+```csharp
+using System.Data.SqlClient;
+
+public SystemUser GetUserAdoNet(string username, string connString)
+{
+    SystemUser user = null;
+    // 1. 手動建立連線與 Command
+    using (var conn = new SqlConnection(connString))
+    using (var cmd = new SqlCommand("SELECT fsUSERNAME, fsROLE FROM tbmUSERS WHERE fsUSERNAME = @username", conn))
+    {
+        // 2. 手動參數化防 SQL 注入
+        cmd.Parameters.AddWithValue("@username", username);
+        
+        conn.Open();
+        // 3. 執行 Reader
+        using (var reader = cmd.ExecuteReader())
+        {
+            if (reader.Read())
+            {
+                // 4. 手動一個欄位一個欄位轉型並映射至 C# 物件
+                user = new SystemUser
+                {
+                    fsUSERNAME = reader["fsUSERNAME"].ToString(),
+                    fsROLE = reader["fsROLE"].ToString()
+                };
+            }
+        }
+    }
+    return user;
+}
+```
+
+###  Dapper 現代寫法 (簡潔、安全)
+```csharp
+using Dapper;
+using System.Data.SqlClient;
+
+public SystemUser GetUserDapper(string username, string connString)
+{
+    using (var conn = new SqlConnection(connString))
+    {
+        // 1. 直接呼叫擴充方法 QueryFirstOrDefault，自動參數化與對應
+        return conn.QueryFirstOrDefault<SystemUser>(
+            "SELECT fsUSERNAME, fsROLE FROM tbmUSERS WHERE fsUSERNAME = @username", 
+            new { username } // 自動參數化
+        );
+    }
+}
+```
+
+---
+
+## 🎯 總結
+
+1. **關係**：Dapper 就是「穿了漂亮外衣」的 ADO.NET。
+2. **連線**：兩者共用相同的連線技術與連線池。
+3. **優勢**：
+   - **ADO.NET** 是您在完全不想引入第三方套件時的底層選擇，但現在幾乎很少有人直接手寫 ADO.NET。
+   - **Dapper** 幫您寫完了 ADO.NET 中最討厭的「開啟連線、參數綁定、手動轉型 Read、關閉連線」等無聊工作，同時保留了接近 100% 的原生 SQL 執行效能。
